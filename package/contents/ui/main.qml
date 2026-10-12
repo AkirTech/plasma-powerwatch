@@ -132,25 +132,29 @@ PlasmoidItem {
         return isNum(sys.components) ? sys.components : null;
     }
 
+    readonly property bool pdOnline: activeUsbc.length > 0
+
     readonly property string powerSourceText: {
-        if (ac.online === true) {
-            if (bat.status === "Charging") {
-                return "交流供电 · 充电中";
-            }
-            if (bat.status === "Full") {
-                return "交流供电 · 已充满";
-            }
-            return "交流供电";
-        }
-        for (var i = 0; i < usbc.length; ++i) {
-            if (usbc[i].online === true) {
-                return "USB-C PD 供电";
-            }
-        }
-        if (bat.present === true) {
+        var source;
+        // 必须先判断 USB-C：ACPI 的 Mains 设备（ADP0）在接了 USB-C PD 时
+        // 同样会报 online=1，所以不能一看到它就断定是"交流供电"。
+        if (pdOnline) {
+            source = "USB-C";
+        } else if (ac.online === true) {
+            source = "交流";
+        } else if (bat.present === true) {
             return "电池供电";
+        } else {
+            return "未知供电";
         }
-        return "未知供电";
+        // 徽标宽度有限，充电/充满时省掉"供电"二字
+        if (bat.status === "Charging") {
+            return source + " · 充电中";
+        }
+        if (bat.status === "Full") {
+            return source + " · 已充满";
+        }
+        return source + "供电";
     }
 
     readonly property string totalCaption: {
@@ -385,6 +389,8 @@ PlasmoidItem {
                                    Kirigami.Theme.highlightColor.g,
                                    Kirigami.Theme.highlightColor.b, 0.18)
                     implicitWidth: badge.implicitWidth + Kirigami.Units.smallSpacing * 2
+                    // 不让布局把徽标压得比文字还窄，否则文字会溢出圆角框
+                    Layout.minimumWidth: implicitWidth
                     implicitHeight: badge.implicitHeight + Math.round(Kirigami.Units.smallSpacing * 0.7)
 
                     PlasmaComponents.Label {
@@ -568,9 +574,28 @@ PlasmoidItem {
                     required property var modelData
                     Layout.fillWidth: true
                     label: "USB-C"
-                    value: root.fmt(modelData.voltage, 2, "V") + " · "
-                           + root.fmt(modelData.current, 2, "A")
-                    note: root.fmt(modelData.power, 1, "W")
+                    // 部分机型的 UCSI 固件不上报电压（voltage 为 null）。
+                    // 这种情况只显示电流并注明它是协商值，绝不把缺失的电压
+                    // 画成 "0.00 V"，也不用 V×I 算出误导性的 0 W。
+                    value: {
+                        if (root.isNum(modelData.voltage) && root.isNum(modelData.current)) {
+                            return root.fmt(modelData.voltage, 2, "V") + " · "
+                                   + root.fmt(modelData.current, 2, "A");
+                        }
+                        if (root.isNum(modelData.current)) {
+                            return root.fmt(modelData.current, 2, "A");
+                        }
+                        return "已接入";
+                    }
+                    note: {
+                        if (modelData.measured === true) {
+                            return root.fmt(modelData.power, 1, "W");
+                        }
+                        if (root.isNum(modelData.current)) {
+                            return "协商值";
+                        }
+                        return "无测量数据";
+                    }
                     fraction: -1
                 }
             }

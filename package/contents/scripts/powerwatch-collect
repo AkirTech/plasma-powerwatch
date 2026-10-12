@@ -124,7 +124,10 @@ for _d in /sys/class/power_supply/*; do
             [ -n "$AC_ONLINE" ] || AC_ONLINE=0
             ;;
         USB)
-            USBC_ROWS="${USBC_ROWS}${_n}|$(rd "$_d/usb_type" || true)|$(rd "$_d/online" || true)|$(rd "$_d/voltage_now" || true)|$(rd "$_d/current_now" || true)|$(rd "$_d/power_now" || true)"$'\n'
+            # UCSI/ACPI 固件实现质量差别很大：不少机器只填 online/status，
+            # voltage_now 恒为 0，current_now 则是协商额定值。这里把所有字段
+            # 原样带出，由下面的输出阶段判断哪些是可信读数。
+            USBC_ROWS="${USBC_ROWS}${_n}|$(rd "$_d/usb_type" || true)|$(rd "$_d/online" || true)|$(rd "$_d/status" || true)|$(rd "$_d/voltage_now" || true)|$(rd "$_d/current_now" || true)|$(rd "$_d/current_max" || true)|$(rd "$_d/power_now" || true)"$'\n'
             ;;
     esac
 done
@@ -143,9 +146,9 @@ if [ "$BAT_PRESENT" = 1 ]; then
     if [ "$BAT_CURR" = "null" ] && isnum "${BAT_P_RAW:-}" && isnum "${BAT_V_RAW:-}" && [ "${BAT_V_RAW:-0}" -gt 0 ]; then
         BAT_CURR=$(awk -v p="$BAT_P_RAW" -v v="$BAT_V_RAW" 'BEGIN{ printf "%.3f", p / v }')
     fi
-    # 缺功率由 V*I 推导（µV * µA / 1e6 = µW）
+    # 缺功率时由 V×I 推导：µV × µA = 1e-12 W，所以要除以 1e12 才得到瓦特
     if [ "$BAT_POW" = "null" ] && isnum "${BAT_V_RAW:-}" && isnum "${BAT_I_RAW:-}" && [ "${BAT_I_RAW:-0}" -gt 0 ]; then
-        BAT_POW=$(awk -v v="$BAT_V_RAW" -v i="$BAT_I_RAW" 'BEGIN{ printf "%.3f", v * i / 1000000 }')
+        BAT_POW=$(awk -v v="$BAT_V_RAW" -v i="$BAT_I_RAW" 'BEGIN{ printf "%.3f", v * i / 1e12 }')
     fi
     # 健康度 = 满充容量 / 设计容量
     if isnum "${BAT_EF_RAW:-}" && isnum "${BAT_EFD_RAW:-}" && [ "${BAT_EFD_RAW:-0}" -gt 0 ]; then
@@ -322,21 +325,42 @@ COMP_SUM=$(awk -v a="$RAPL_PKG" -v b="$GPU_POW" -v c="$RAPL_PSYS" \
 # ============================================================ 输出 JSON =====
 emit() {
 # USB-C PD 数组
+#
+# 关键点：power_supply 的「0」有两种含义 —— 真的量到 0，或者固件压根没提供。
+# 实测某台联想笔记本接 USB-C PD 时，voltage_now 恒为 0 而 current_now 恒为
+# 7000000 µA（空载与满载完全一致），后者其实是协商额定值。
+# 因此这里把「上报 0 或字段缺失」统一记成 null（未知），绝不把 0 当读数用；
+# 并用 measured 说明这组数字是否构成一次完整测量（电压与电流都有）。
 _usbc_json=""
 if [ -n "$USBC_ROWS" ]; then
-    while IFS='|' read -r _n _ut _on _uv _ui _up; do
+    while IFS='|' read -r _n _ut _on _ust _uv _ui _uimax _up; do
         [ -n "${_n:-}" ] || continue
         _port=${_n#ucsi-source-psy-}
-        _v=null; _i=null; _p=null
-        isnum "${_uv:-}" && _v=$(fdiv "$_uv" 1000000 2)
-        isnum "${_ui:-}" && _i=$(fdiv "$_ui" 1000000 2)
-        if isnum "${_up:-}"; then
-            _p=$(fdiv "$_up" 1000000 2)
-        elif [ "$_v" != "null" ] && [ "$_i" != "null" ]; then
-            _p=$(awk -v v="$_uv" -v i="$_ui" 'BEGIN{ printf "%.2f", v * i / 1000000 }')
+        _v=null; _i=null; _imax=null; _p=null; _measured=false
+
+        if isnum "${_uv:-}" && [ "$_uv" -gt 0 ]; then
+            _v=$(fdiv "$_uv" 1000000 2)
         fi
+        if isnum "${_ui:-}" && [ "$_ui" -gt 0 ]; then
+            _i=$(fdiv "$_ui" 1000000 2)
+        fi
+        if isnum "${_uimax:-}" && [ "$_uimax" -gt 0 ]; then
+            _imax=$(fdiv "$_uimax" 1000000 2)
+        fi
+
+        # measured 只描述「这组数字是否构成一次完整测量」（电压与电流都有）
+        if [ "$_v" != "null" ] && [ "$_i" != "null" ]; then
+            _measured=true
+        fi
+        # 固件直接给出功率时优先采信，否则由 V×I 推导（µV × µA = 1e-12 W）
+        if isnum "${_up:-}" && [ "$_up" -gt 0 ]; then
+            _p=$(fdiv "$_up" 1000000 2)
+        elif [ "$_measured" = true ]; then
+            _p=$(awk -v v="$_uv" -v i="$_ui" 'BEGIN{ printf "%.2f", v * i / 1e12 }')
+        fi
+
         [ -n "$_usbc_json" ] && _usbc_json="${_usbc_json},"
-        _usbc_json="${_usbc_json}{\"name\":\"$(jesc "$_port")\",\"type\":\"$(jesc "$_ut")\",\"online\":$(boolv "${_on:-0}"),\"voltage\":${_v},\"current\":${_i},\"power\":${_p}}"
+        _usbc_json="${_usbc_json}{\"name\":\"$(jesc "$_port")\",\"type\":\"$(jesc "$_ut")\",\"status\":\"$(jesc "${_ust:-}")\",\"online\":$(boolv "${_on:-0}"),\"voltage\":${_v},\"current\":${_i},\"current_max\":${_imax},\"power\":${_p},\"measured\":${_measured}}"
     done <<< "$USBC_ROWS"
 fi
 
