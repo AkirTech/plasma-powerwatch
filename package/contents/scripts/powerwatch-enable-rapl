@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+#
+# SPDX-FileCopyrightText: 2026 AkirTech
+# SPDX-License-Identifier: GPL-2.0-or-later
+# ============================================================================
+# powerwatch-enable-rapl — 允许普通用户读取 Intel RAPL 功耗计数器
+#
+# Intel RAPL 的 /sys/class/powercap/intel-rapl:*/energy_uj 默认只有 root 可读，
+# 导致功耗监测小部件读不到 CPU 功耗。本脚本安装一条 udev 规则永久放行。
+#
+#   sudo <本脚本路径>            # 启用
+#   sudo <本脚本路径> --undo     # 撤销
+# ============================================================================
+
+set -u
+
+RULE_FILE=/etc/udev/rules.d/99-powerwatch-rapl.rules
+
+# 注意：/sys/class/powercap/intel-rapl:0 是符号链接，`chmod -R` 不会递归进去，
+# 必须用通配符逐个指向 energy_uj 文件本身。
+GRANT_CMD='chmod a+r /sys/class/powercap/*/energy_uj 2>/dev/null || true'
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "需要 root 权限，请这样运行：" >&2
+    echo "    sudo $0 $*" >&2
+    exit 1
+fi
+
+# ---------------------------------------------------------------- 撤销 ----
+if [ "${1:-}" = "--undo" ]; then
+    if [ -e "$RULE_FILE" ]; then
+        rm -f "$RULE_FILE"
+        udevadm control --reload-rules 2>/dev/null || true
+        echo "已删除 $RULE_FILE"
+    else
+        echo "规则不存在，无需撤销"
+    fi
+    echo "注意：已放行的权限保持到本次重启，重启后恢复默认。"
+    exit 0
+fi
+
+# ---------------------------------------------------------------- 安装 ----
+cat > "$RULE_FILE" <<EOF
+# Power Watch：让普通用户可以读取 Intel RAPL 功耗计数器（energy_uj）
+SUBSYSTEM=="powercap", ACTION=="add|change", RUN+="/bin/sh -c '$GRANT_CMD'"
+EOF
+
+chmod 0644 "$RULE_FILE"
+udevadm control --reload-rules 2>/dev/null || true
+
+echo "已安装 $RULE_FILE"
+
+# 立即生效，不必等重启
+sh -c "$GRANT_CMD"
+
+# ---------------------------------------------------------------- 校验 ----
+# 本脚本以 root 运行，[ -r ] 永远为真，所以必须直接看权限位。
+fail=0
+found=0
+for f in /sys/class/powercap/*/energy_uj; do
+    [ -e "$f" ] || continue
+    found=1
+    mode=$(stat -c '%a' "$f" 2>/dev/null || echo '?')
+    printf '  %-52s %s\n' "$f" "$mode"
+    case "$mode" in
+        *[4567]) ;;
+        *) fail=1 ;;
+    esac
+done
+
+if [ "$found" = 0 ]; then
+    echo "警告：找不到任何 energy_uj，内核可能没提供 intel-rapl。" >&2
+    exit 1
+fi
+
+if [ "$fail" = 1 ]; then
+    echo "失败：权限没有生效（其他用户仍不可读）。" >&2
+    exit 1
+fi
+
+echo "成功：普通用户现在可以读取 RAPL，小部件会在两次采样后显示 CPU 功耗。"

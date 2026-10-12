@@ -1,0 +1,386 @@
+#!/usr/bin/env bash
+#
+# SPDX-FileCopyrightText: 2026 AkirTech
+# SPDX-License-Identifier: GPL-2.0-or-later
+# ============================================================================
+# powerwatch-collect — Power Watch 小部件数据采集器
+#
+# 读取本机功耗 / 电压 / 电流，向 stdout 输出一行 JSON。
+#
+# 数据来源：
+#   /sys/class/power_supply   电池（电压/电流/功率/电量）、交流适配器、USB-C PD
+#   /sys/class/powercap       Intel RAPL（CPU 封装/核心/非核心功耗）* 需 root
+#   /sys/class/hwmon          coretemp 温度
+#   /sys/devices/system/cpu   CPU 当前频率
+#   nvidia-smi                独立显卡功耗（带缓存，避免唤醒挂起的独显）
+#
+# 用法：  powerwatch-collect [--pretty] [--gpu-poll=秒] [--force-gpu]
+#
+#   --pretty        格式化输出，便于人工查看
+#   --gpu-poll=N    独显采样间隔秒数（默认 10；0 = 完全不轮询）
+#   --force-gpu     独显挂起时也读取（会唤醒独显，更耗电）
+#
+# 环境变量：
+#   POWERWATCH_GPU_POLL    独显采样间隔秒数（默认 10；0 = 完全不轮询）
+#   POWERWATCH_FORCE_GPU   1 = 独显挂起时也读取（会唤醒独显，更耗电）
+#   POWERWATCH_STATE_DIR   状态目录（默认 $XDG_RUNTIME_DIR/powerwatch）
+# ============================================================================
+
+set -u
+
+GPU_POLL="${POWERWATCH_GPU_POLL:-10}"
+FORCE_GPU="${POWERWATCH_FORCE_GPU:-0}"
+PRETTY=0
+
+# 注意：KDE 的 executable dataengine 用 QProcess::start(program, args) 直接切分
+# 参数、不经 shell，所以小部件只能通过命令行参数传配置，不能写 "VAR=x cmd"。
+_argv=("$@")
+_i=0
+while [ "$_i" -lt "${#_argv[@]}" ]; do
+    _a="${_argv[$_i]}"
+    case "$_a" in
+        --gpu-poll=*) GPU_POLL="${_a#*=}" ;;
+        --gpu-poll)   _i=$(( _i + 1 )); GPU_POLL="${_argv[$_i]:-10}" ;;
+        --force-gpu)  FORCE_GPU=1 ;;
+        --pretty)     PRETTY=1 ;;
+        -h|--help)    awk 'NR>2 && /^# =====/ {exit} NR>2 {sub(/^# ?/, ""); print}' "$0"; exit 0 ;;
+    esac
+    _i=$(( _i + 1 ))
+done
+
+STATE_DIR="${POWERWATCH_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/powerwatch}"
+mkdir -p "$STATE_DIR" 2>/dev/null || STATE_DIR="/tmp/powerwatch-$(id -u)"
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+# ---------------------------------------------------------------- 时间戳 ----
+# 微秒级时间戳，优先用 bash 内建，避免每次采样都 fork 一个 date
+if [ -n "${EPOCHREALTIME:-}" ]; then
+    _secs=${EPOCHREALTIME%.*}
+    _frac=${EPOCHREALTIME#*.}
+    NOW_US=$(( _secs * 1000000 + 10#${_frac:0:6} ))
+else
+    NOW_US=$(( $(date +%s) * 1000000 ))
+fi
+
+# ------------------------------------------------------------ 通用工具函数 ----
+rd() {  # 读取文件首行，失败或空则返回非零
+    local v
+    [ -r "$1" ] || return 1
+    IFS= read -r v < "$1" 2>/dev/null || return 1
+    printf '%s' "$v"
+}
+
+isnum() { case "${1-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
+
+boolv() { [ "${1:-0}" = "1" ] && printf 'true' || printf 'false'; }
+
+jesc() {  # JSON 字符串转义
+    local s=${1-}
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/ }
+    s=${s//$'\r'/ }
+    s=${s//$'\t'/ }
+    printf '%s' "$s"
+}
+
+fdiv() {  # fdiv <整数> <除数> <小数位>  →  十进制字符串（纯 bash，不 fork）
+    local v=${1-} d=${2:-1} dec=${3:-2} scale q
+    isnum "$v" || { printf 'null'; return; }
+    scale=$(( 10 ** dec ))
+    q=$(( (v * scale + d / 2) / d ))
+    printf '%d.%0*d' $(( q / scale )) "$dec" $(( q % scale ))
+}
+
+# =============================================================== 电池 ========
+BAT_PRESENT=0
+BAT_NAME=""; BAT_STATUS=""; BAT_CAP=""
+BAT_V_RAW=""; BAT_P_RAW=""; BAT_I_RAW=""
+BAT_EN_RAW=""; BAT_EF_RAW=""; BAT_EFD_RAW=""; BAT_CYC=""
+
+AC_PRESENT=0; AC_NAME=""; AC_ONLINE="0"
+
+USBC_ROWS=""
+
+for _d in /sys/class/power_supply/*; do
+    [ -d "$_d" ] || continue
+    _t=$(rd "$_d/type") || continue
+    _n=$(basename "$_d")
+    case "$_t" in
+        Battery)
+            BAT_PRESENT=1; BAT_NAME="$_n"
+            BAT_STATUS=$(rd "$_d/status" || true)
+            BAT_CAP=$(rd "$_d/capacity" || true)
+            BAT_V_RAW=$(rd "$_d/voltage_now" || true)
+            BAT_P_RAW=$(rd "$_d/power_now" || true)
+            BAT_I_RAW=$(rd "$_d/current_now" || true)
+            BAT_EN_RAW=$(rd "$_d/energy_now" || true)
+            BAT_EF_RAW=$(rd "$_d/energy_full" || true)
+            BAT_EFD_RAW=$(rd "$_d/energy_full_design" || true)
+            BAT_CYC=$(rd "$_d/cycle_count" || true)
+            ;;
+        Mains)
+            AC_PRESENT=1; AC_NAME="$_n"; AC_ONLINE=$(rd "$_d/online" || true)
+            [ -n "$AC_ONLINE" ] || AC_ONLINE=0
+            ;;
+        USB)
+            USBC_ROWS="${USBC_ROWS}${_n}|$(rd "$_d/usb_type" || true)|$(rd "$_d/online" || true)|$(rd "$_d/voltage_now" || true)|$(rd "$_d/current_now" || true)|$(rd "$_d/power_now" || true)"$'\n'
+            ;;
+    esac
+done
+
+BAT_VOLT=null; BAT_CURR=null; BAT_POW=null
+BAT_WH=null; BAT_FULL=null; BAT_HEALTH=null; BAT_LEFT=null
+
+if [ "$BAT_PRESENT" = 1 ]; then
+    isnum "${BAT_V_RAW:-}" && BAT_VOLT=$(fdiv "$BAT_V_RAW" 1000000 3)
+    isnum "${BAT_P_RAW:-}" && BAT_POW=$(fdiv "$BAT_P_RAW" 1000000 3)
+    isnum "${BAT_I_RAW:-}" && BAT_CURR=$(fdiv "$BAT_I_RAW" 1000000 3)
+    isnum "${BAT_EN_RAW:-}" && BAT_WH=$(fdiv "$BAT_EN_RAW" 1000000 2)
+    isnum "${BAT_EF_RAW:-}" && BAT_FULL=$(fdiv "$BAT_EF_RAW" 1000000 2)
+    isnum "${BAT_EFD_RAW:-}" && BAT_EFD="$(fdiv "$BAT_EFD_RAW" 1000000 2)"
+    # 缺电流由 P/V 推导（µW / µV = A）
+    if [ "$BAT_CURR" = "null" ] && isnum "${BAT_P_RAW:-}" && isnum "${BAT_V_RAW:-}" && [ "${BAT_V_RAW:-0}" -gt 0 ]; then
+        BAT_CURR=$(awk -v p="$BAT_P_RAW" -v v="$BAT_V_RAW" 'BEGIN{ printf "%.3f", p / v }')
+    fi
+    # 缺功率由 V*I 推导（µV * µA / 1e6 = µW）
+    if [ "$BAT_POW" = "null" ] && isnum "${BAT_V_RAW:-}" && isnum "${BAT_I_RAW:-}" && [ "${BAT_I_RAW:-0}" -gt 0 ]; then
+        BAT_POW=$(awk -v v="$BAT_V_RAW" -v i="$BAT_I_RAW" 'BEGIN{ printf "%.3f", v * i / 1000000 }')
+    fi
+    # 健康度 = 满充容量 / 设计容量
+    if isnum "${BAT_EF_RAW:-}" && isnum "${BAT_EFD_RAW:-}" && [ "${BAT_EFD_RAW:-0}" -gt 0 ]; then
+        BAT_HEALTH=$(fdiv $(( BAT_EF_RAW * 100 )) "$BAT_EFD_RAW" 1)
+    fi
+    # 剩余时间（秒）：能量(µWh) / 功率(µW) = 小时
+    if [ "${BAT_STATUS:-}" = "Discharging" ] && isnum "${BAT_EN_RAW:-}" && isnum "${BAT_P_RAW:-}" && [ "${BAT_P_RAW:-0}" -gt 0 ]; then
+        BAT_LEFT=$(( BAT_EN_RAW * 3600 / BAT_P_RAW ))
+    fi
+fi
+
+# ========================================================== CPU RAPL ========
+RAPL_AVAILABLE=false
+RAPL_REASON=""
+RAPL_DOMAINS=""
+RAPL_PKG=null
+RAPL_PERM_DENIED=0
+RAPL_PRESENT=0
+
+for _r in /sys/class/powercap/intel-rapl:[0-9]*; do
+    [ -d "$_r" ] || continue
+    RAPL_PRESENT=1
+    _rname=$(rd "$_r/name") || continue
+    _f="$_r/energy_uj"
+    if [ ! -e "$_f" ]; then
+        RAPL_REASON="内核未提供 energy_uj"
+        continue
+    fi
+    if [ ! -r "$_f" ]; then
+        RAPL_PERM_DENIED=1
+        continue
+    fi
+    _e=$(rd "$_f") || continue
+    isnum "${_e:-}" || continue
+
+    _sf="$STATE_DIR/rapl-$(printf '%s' "$_r" | tr '/:' '__')"
+    _pe=""; _pt=""
+    if [ -r "$_sf" ]; then IFS=' ' read -r _pe _pt < "$_sf" 2>/dev/null || true; fi
+    printf '%s %s\n' "$_e" "$NOW_US" > "$_sf" 2>/dev/null
+
+    if isnum "${_pe:-}" && isnum "${_pt:-}" && [ "${_pt:-0}" -gt 0 ]; then
+        _dt=$(( NOW_US - _pt ))
+        # 0.2s ~ 60s 之间的采样才算有效
+        if [ "$_dt" -ge 200000 ] && [ "$_dt" -le 60000000 ]; then
+            _de=$(( _e - _pe ))
+            if [ "$_de" -lt 0 ]; then   # 计数器回绕
+                _max=$(rd "$_r/max_energy_range_uj" || true)
+                if isnum "${_max:-}"; then _de=$(( _de + _max )); fi
+            fi
+            _pw=$(fdiv "$_de" "$_dt" 2)   # µJ / µs = W
+            RAPL_DOMAINS="${RAPL_DOMAINS}${_rname}|${_pw}"$'\n'
+            RAPL_AVAILABLE=true
+            [ "$_rname" = "package-0" ] && RAPL_PKG="$_pw"
+            [ "$_rname" = "psys" ] && RAPL_PSYS="$_pw"
+        fi
+    fi
+done
+RAPL_PSYS=${RAPL_PSYS:-null}
+
+if [ "$RAPL_AVAILABLE" = false ]; then
+    if [ "$RAPL_PERM_DENIED" = 1 ]; then
+        RAPL_REASON="CPU 功耗需 root 权限（小部件设置页有说明）"
+    elif [ "$RAPL_PRESENT" = 0 ]; then
+        RAPL_REASON="本机没有 RAPL 功耗计数器"
+    elif [ -z "$RAPL_REASON" ]; then
+        RAPL_REASON="正在采集（需要两次采样）"
+    fi
+fi
+
+# ============================================================ CPU 其它 ======
+CPU_TEMP=null; CPU_TEMP_MAX=null; CPU_FREQ=null; CPU_MODEL=""
+
+while IFS= read -r _line; do
+    case "$_line" in
+        "model name"*) CPU_MODEL=${_line#*: }; CPU_MODEL=${CPU_MODEL# }; break ;;
+    esac
+done < /proc/cpuinfo
+
+for _h in /sys/class/hwmon/hwmon*; do
+    [ -d "$_h" ] || continue
+    [ "$(rd "$_h/name" || true)" = "coretemp" ] || continue
+    _pk=$(rd "$_h/temp1_input" || true)
+    isnum "${_pk:-}" && CPU_TEMP=$(fdiv "$_pk" 1000 1)
+    _mx=""
+    for _f in "$_h"/temp*_input; do
+        _v=$(rd "$_f" || true)
+        isnum "${_v:-}" || continue
+        if [ -z "$_mx" ] || [ "$_v" -gt "$_mx" ]; then _mx=$_v; fi
+    done
+    isnum "${_mx:-}" && CPU_TEMP_MAX=$(fdiv "$_mx" 1000 1)
+    break
+done
+
+_fsum=0; _fcnt=0
+for _f in /sys/devices/system/cpu/cpufreq/policy*/scaling_cur_freq; do
+    _v=$(rd "$_f" || true)
+    isnum "${_v:-}" || continue
+    _fsum=$(( _fsum + _v )); _fcnt=$(( _fcnt + 1 ))
+done
+[ "$_fcnt" -gt 0 ] && CPU_FREQ=$(( _fsum / _fcnt / 1000 ))
+
+PLATFORM_PROFILE=$(rd /sys/firmware/acpi/platform_profile || true)
+
+# =============================================================== 独显 =======
+GPU_AVAILABLE=false
+GPU_STATE="unknown"
+GPU_NAME=""; GPU_POW=null; GPU_TEMP=null; GPU_UTIL=null; GPU_AGE=null
+
+_nvdev=""
+for _d in /sys/bus/pci/devices/*; do
+    [ -r "$_d/vendor" ] || continue
+    [ "$(rd "$_d/vendor")" = "0x10de" ] || continue
+    case "$(rd "$_d/class" || true)" in
+        0x03*) _nvdev="$_d"; break ;;
+    esac
+done
+if [ -n "$_nvdev" ]; then
+    GPU_STATE=$(rd "$_nvdev/power/runtime_status" || true)
+    [ -n "$GPU_STATE" ] || GPU_STATE="unknown"
+fi
+
+GPU_CACHE="$STATE_DIR/gpu.tsv"
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_AVAILABLE=true
+    _cts=""; _cp=""; _ct=""; _cu=""; _cn=""
+    if [ -r "$GPU_CACHE" ]; then
+        IFS=$'\t' read -r _cts _cp _ct _cu _cn < "$GPU_CACHE" 2>/dev/null || true
+    fi
+    if isnum "${_cts:-}"; then
+        GPU_POW="${_cp:-null}"; GPU_TEMP="${_ct:-null}"; GPU_UTIL="${_cu:-null}"; GPU_NAME="${_cn:-}"
+        GPU_AGE=$(fdiv $(( NOW_US - _cts )) 1000000 1)
+    fi
+
+    # 决定是否需要刷新缓存：独显挂起时不主动唤醒（nvidia-smi 每次要 3s+ 且会拉高功耗）
+    _need=0
+    if ! isnum "${_cts:-}"; then
+        _need=1
+    elif [ "${GPU_POLL:-0}" != "0" ] && [ $(( NOW_US - _cts )) -ge $(( GPU_POLL * 1000000 )) ]; then
+        _need=1
+    fi
+    if [ "$_need" = 1 ] && { [ "$FORCE_GPU" = 1 ] || [ "$GPU_STATE" != "suspended" ]; }; then
+        (
+            _out=$(timeout 8 nvidia-smi \
+                --query-gpu=power.draw,temperature.gpu,utilization.gpu,name \
+                --format=csv,noheader,nounits 2>/dev/null | head -n 1)
+            case "$_out" in
+                *[![:space:]]*)
+                    IFS=',' read -r _p _t _u _n <<< "$_out"
+                    _p=${_p// /}; _t=${_t// /}; _u=${_u// /}
+                    _n=${_n# }; _n=${_n% }
+                    printf '%s\t%s\t%s\t%s\t%s\n' "$NOW_US" "$_p" "$_t" "$_u" "$_n" > "$GPU_CACHE.tmp" \
+                        && mv -f "$GPU_CACHE.tmp" "$GPU_CACHE"
+                    ;;
+            esac
+        ) >/dev/null 2>&1 &
+    fi
+fi
+
+# ========================================================== 汇总功耗 ========
+SYS_POWER=null
+SYS_SOURCE="none"
+if [ "$BAT_PRESENT" = 1 ] && [ "${BAT_STATUS:-}" = "Discharging" ] && [ "$BAT_POW" != "null" ]; then
+    SYS_POWER="$BAT_POW"      # 电池放电功率 == 整机真实功耗
+    SYS_SOURCE="battery"
+fi
+
+COMP_SUM=$(awk -v a="$RAPL_PKG" -v b="$GPU_POW" -v c="$RAPL_PSYS" \
+    'BEGIN{ s=0; n=0;
+            if (a != "null") { s += a; n++ }
+            if (b != "null") { s += b; n++ }
+            if (c != "null" && a == "null") { s += c; n++ }
+            if (n > 0) printf "%.2f", s; else print "null" }')
+
+# ============================================================ 输出 JSON =====
+emit() {
+# USB-C PD 数组
+_usbc_json=""
+if [ -n "$USBC_ROWS" ]; then
+    while IFS='|' read -r _n _ut _on _uv _ui _up; do
+        [ -n "${_n:-}" ] || continue
+        _port=${_n#ucsi-source-psy-}
+        _v=null; _i=null; _p=null
+        isnum "${_uv:-}" && _v=$(fdiv "$_uv" 1000000 2)
+        isnum "${_ui:-}" && _i=$(fdiv "$_ui" 1000000 2)
+        if isnum "${_up:-}"; then
+            _p=$(fdiv "$_up" 1000000 2)
+        elif [ "$_v" != "null" ] && [ "$_i" != "null" ]; then
+            _p=$(awk -v v="$_uv" -v i="$_ui" 'BEGIN{ printf "%.2f", v * i / 1000000 }')
+        fi
+        [ -n "$_usbc_json" ] && _usbc_json="${_usbc_json},"
+        _usbc_json="${_usbc_json}{\"name\":\"$(jesc "$_port")\",\"type\":\"$(jesc "$_ut")\",\"online\":$(boolv "${_on:-0}"),\"voltage\":${_v},\"current\":${_i},\"power\":${_p}}"
+    done <<< "$USBC_ROWS"
+fi
+
+# RAPL 域对象
+_rapl_json=""
+if [ -n "$RAPL_DOMAINS" ]; then
+    while IFS='|' read -r _n _p; do
+        [ -n "${_n:-}" ] || continue
+        [ -n "$_rapl_json" ] && _rapl_json="${_rapl_json},"
+        _rapl_json="${_rapl_json}\"$(jesc "$_n")\":${_p}"
+    done <<< "$RAPL_DOMAINS"
+fi
+
+printf '{"ok":true,"ts":%s,' "$(fdiv "$NOW_US" 1000000 3)"
+
+printf '"battery":{"present":%s,"name":"%s","status":"%s","percent":%s,"voltage":%s,"current":%s,"power":%s,"energy_wh":%s,"full_wh":%s,"health":%s,"cycles":%s,"time_left":%s},' \
+    "$(boolv "$BAT_PRESENT")" "$(jesc "$BAT_NAME")" "$(jesc "${BAT_STATUS:-}")" \
+    "$([ -n "${BAT_CAP:-}" ] && printf '%s' "$BAT_CAP" || printf 'null')" \
+    "$BAT_VOLT" "$BAT_CURR" "$BAT_POW" "$BAT_WH" "$BAT_FULL" "$BAT_HEALTH" \
+    "$([ -n "${BAT_CYC:-}" ] && printf '%s' "$BAT_CYC" || printf 'null')" "$BAT_LEFT"
+
+printf '"ac":{"present":%s,"name":"%s","online":%s},' \
+    "$(boolv "$AC_PRESENT")" "$(jesc "$AC_NAME")" "$(boolv "${AC_ONLINE:-0}")"
+
+printf '"usbc":[%s],' "$_usbc_json"
+
+printf '"rapl":{"available":%s,"reason":"%s","domains":{%s}},"sys_power":%s,"psys":%s,' \
+    "$RAPL_AVAILABLE" "$(jesc "${RAPL_REASON:-}")" "$_rapl_json" "$SYS_POWER" "$RAPL_PSYS"
+
+printf '"cpu":{"model":"%s","temp":%s,"temp_max":%s,"freq_mhz":%s,"profile":"%s"},' \
+    "$(jesc "$CPU_MODEL")" "$CPU_TEMP" "$CPU_TEMP_MAX" \
+    "$([ -n "${CPU_FREQ:-}" ] && printf '%s' "$CPU_FREQ" || printf 'null')" \
+    "$(jesc "${PLATFORM_PROFILE:-}")"
+
+printf '"gpu":{"available":%s,"state":"%s","name":"%s","power":%s,"temp":%s,"util":%s,"age":%s},' \
+    "$GPU_AVAILABLE" "$(jesc "$GPU_STATE")" "$(jesc "$GPU_NAME")" \
+    "$GPU_POW" "$GPU_TEMP" "$GPU_UTIL" "$GPU_AGE"
+
+printf '"system":{"power":%s,"source":"%s","components":%s}}\n' \
+    "$SYS_POWER" "$SYS_SOURCE" "$COMP_SUM"
+}
+
+if [ "$PRETTY" = 1 ] && command -v python3 >/dev/null 2>&1; then
+    emit | python3 -m json.tool
+else
+    emit
+fi

@@ -1,0 +1,23 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "AkirTech"
+            }
+        ],
+        "BugReportUrl": "https://github.com/AkirTech/plasma-powerwatch/issues",
+        "Category": "System Information",
+        "Description": "Monitor power draw, voltage and current in real time",
+        "Description[zh_CN]": "实时监测整机功耗、电压、电流与温度",
+        "EnabledByDefault": true,
+        "Icon": "utilities-system-monitor",
+        "Id": "io.github.akirtech.powerwatch",
+        "License": "GPL-2.0-or-later",
+        "Name": "Power Watch",
+        "Name[zh_CN]": "功耗监测",
+        "Version": "1.0.0",
+        "Website": "https://github.com/AkirTech/plasma-powerwatch"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}

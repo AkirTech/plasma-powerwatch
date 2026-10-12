@@ -1,0 +1,16 @@
+# Qt / QML 编译缓存
+*.qmlc
+*.jsc
+.qmlcache/
+
+# 打包产物
+*.plasmoid
+*.zip
+*.tar.gz
+
+# 编辑器 / 系统杂项
+*.swp
+*~
+.idea/
+.vscode/
+.DS_Store

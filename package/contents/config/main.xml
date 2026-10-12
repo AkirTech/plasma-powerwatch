@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kcfg xmlns="http://www.kde.org/standards/kcfg/1.0"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="http://www.kde.org/standards/kcfg/1.0
+                          http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
+  <kcfgfile name=""/>
+  <group name="General">
+    <entry name="interval" type="Int">
+      <label>刷新间隔（秒）</label>
+      <default>2</default>
+    </entry>
+    <entry name="gpuPollSeconds" type="Int">
+      <label>独立显卡采样间隔（秒，0 = 不采样）</label>
+      <default>10</default>
+    </entry>
+    <entry name="showGraph" type="Bool">
+      <label>显示功耗历史曲线</label>
+      <default>true</default>
+    </entry>
+    <entry name="showCpu" type="Bool">
+      <label>显示 CPU</label>
+      <default>true</default>
+    </entry>
+    <entry name="showGpu" type="Bool">
+      <label>显示独立显卡</label>
+      <default>true</default>
+    </entry>
+    <entry name="showBattery" type="Bool">
+      <label>显示电池详情</label>
+      <default>true</default>
+    </entry>
+    <entry name="showPowerSources" type="Bool">
+      <label>显示适配器 / USB-C PD</label>
+      <default>true</default>
+    </entry>
+    <entry name="showSessionEnergy" type="Bool">
+      <label>显示本次会话累计用电量</label>
+      <default>true</default>
+    </entry>
+  </group>
+</kcfg>
