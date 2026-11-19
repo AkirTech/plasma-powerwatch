@@ -72,6 +72,16 @@ rd() {  # 读取文件首行，失败或空则返回非零
 
 isnum() { case "${1-}" in ''|*[!0-9]*) return 1 ;; esac; return 0; }
 
+# 十进制数（至多一个小数点，且至少要有一位数字）。
+# 用来校验 nvidia-smi 一类的输出：它出错时会把报错文字打到 stdout，
+# 直接当数值用会污染整个 JSON。
+isdec() {
+    case "${1-}" in
+        ''|*[!0-9.]*|*.*.*) return 1 ;;
+    esac
+    case "${1-}" in *[0-9]*) return 0 ;; *) return 1 ;; esac
+}
+
 boolv() { [ "${1:-0}" = "1" ] && printf 'true' || printf 'false'; }
 
 jesc() {  # JSON 字符串转义
@@ -256,6 +266,7 @@ PLATFORM_PROFILE=$(rd /sys/firmware/acpi/platform_profile || true)
 GPU_AVAILABLE=false
 GPU_STATE="unknown"
 GPU_NAME=""; GPU_POW=null; GPU_TEMP=null; GPU_UTIL=null; GPU_AGE=null
+GPU_ERROR=false
 
 _nvdev=""
 for _d in /sys/bus/pci/devices/*; do
@@ -273,13 +284,28 @@ fi
 GPU_CACHE="$STATE_DIR/gpu.tsv"
 if command -v nvidia-smi >/dev/null 2>&1; then
     GPU_AVAILABLE=true
-    _cts=""; _cp=""; _ct=""; _cu=""; _cn=""
+    # 缓存列：采样时间 \t 功耗 \t 温度 \t 占用 \t 名称 \t nvidia-smi 退出码
+    _cts=""; _cp=""; _ct=""; _cu=""; _cn=""; _crc=""
     if [ -r "$GPU_CACHE" ]; then
-        IFS=$'\t' read -r _cts _cp _ct _cu _cn < "$GPU_CACHE" 2>/dev/null || true
+        IFS=$'\t' read -r _cts _cp _ct _cu _cn _crc < "$GPU_CACHE" 2>/dev/null || true
     fi
     if isnum "${_cts:-}"; then
-        GPU_POW="${_cp:-null}"; GPU_TEMP="${_ct:-null}"; GPU_UTIL="${_cu:-null}"; GPU_NAME="${_cn:-}"
         GPU_AGE=$(fdiv $(( NOW_US - _cts )) 1000000 1)
+        # 空字段在写缓存时用 "-" 占位，这里还原
+        [ "${_cp:-}" = "-" ] && _cp=""
+        [ "${_ct:-}" = "-" ] && _ct=""
+        [ "${_cu:-}" = "-" ] && _cu=""
+        [ "${_cn:-}" = "-" ] && _cn=""
+        # 只采信数值。nvidia-smi 失败时会把一整段报错写到 stdout，
+        # 旧版本把它当成功耗存进缓存，导致 JSON 里出现裸的英文串、整个输出非法。
+        isdec "${_cp:-}" && GPU_POW="$_cp"
+        isdec "${_ct:-}" && GPU_TEMP="$_ct"
+        isdec "${_cu:-}" && GPU_UTIL="$_cu"
+        GPU_NAME="${_cn:-}"
+        GPU_NAME="${GPU_NAME:0:64}"
+        if isnum "${_crc:-}" && [ "${_crc:-0}" -ne 0 ]; then
+            GPU_ERROR=true
+        fi
     fi
 
     # 决定是否需要刷新缓存：独显挂起时不主动唤醒（nvidia-smi 每次要 3s+ 且会拉高功耗）
@@ -291,18 +317,29 @@ if command -v nvidia-smi >/dev/null 2>&1; then
     fi
     if [ "$_need" = 1 ] && { [ "$FORCE_GPU" = 1 ] || [ "$GPU_STATE" != "suspended" ]; }; then
         (
+            # 不要把输出接进 head：那样 $? 拿到的是 head 的退出码，而不是 nvidia-smi 的
             _out=$(timeout 8 nvidia-smi \
                 --query-gpu=power.draw,temperature.gpu,utilization.gpu,name \
-                --format=csv,noheader,nounits 2>/dev/null | head -n 1)
-            case "$_out" in
-                *[![:space:]]*)
-                    IFS=',' read -r _p _t _u _n <<< "$_out"
-                    _p=${_p// /}; _t=${_t// /}; _u=${_u// /}
-                    _n=${_n# }; _n=${_n% }
-                    printf '%s\t%s\t%s\t%s\t%s\n' "$NOW_US" "$_p" "$_t" "$_u" "$_n" > "$GPU_CACHE.tmp" \
-                        && mv -f "$GPU_CACHE.tmp" "$GPU_CACHE"
-                    ;;
-            esac
+                --format=csv,noheader,nounits 2>/dev/null)
+            _rc=$?
+            if [ "$_rc" -eq 0 ] && [ -n "$_out" ]; then
+                _out=${_out%%$'\n'*}
+                IFS=',' read -r _p _t _u _n <<< "$_out"
+                _p=${_p// /}; _t=${_t// /}; _u=${_u// /}
+                _n=${_n# }; _n=${_n% }
+                # 名称里的 tab/换行会撑坏缓存列，先拍平
+                _n=${_n//$'\t'/ }; _n=${_n//$'\n'/ }; _n=${_n:0:64}
+                # 空字段一律写 "-"：bash 的 read 以 tab 作 IFS 时会把连续分隔符
+                # 折叠，空字段会让后面的列整体错位（曾把退出码读成了功耗）
+                printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$NOW_US" \
+                    "${_p:--}" "${_t:--}" "${_u:--}" "${_n:--}" "0" > "$GPU_CACHE.tmp" \
+                    && mv -f "$GPU_CACHE.tmp" "$GPU_CACHE"
+            else
+                # 失败也要落盘：让下一次采样知道"读不到"，
+                # 而不是一直把上一次成功的旧值当成当前值显示
+                printf '%s\t-\t-\t-\t-\t%s\n' "$NOW_US" "$_rc" > "$GPU_CACHE.tmp" \
+                    && mv -f "$GPU_CACHE.tmp" "$GPU_CACHE"
+            fi
         ) >/dev/null 2>&1 &
     fi
 fi
@@ -378,9 +415,9 @@ printf '{"ok":true,"ts":%s,' "$(fdiv "$NOW_US" 1000000 3)"
 
 printf '"battery":{"present":%s,"name":"%s","status":"%s","percent":%s,"voltage":%s,"current":%s,"power":%s,"energy_wh":%s,"full_wh":%s,"health":%s,"cycles":%s,"time_left":%s},' \
     "$(boolv "$BAT_PRESENT")" "$(jesc "$BAT_NAME")" "$(jesc "${BAT_STATUS:-}")" \
-    "$([ -n "${BAT_CAP:-}" ] && printf '%s' "$BAT_CAP" || printf 'null')" \
+    "$(isnum "${BAT_CAP:-}" && printf '%s' "$BAT_CAP" || printf 'null')" \
     "$BAT_VOLT" "$BAT_CURR" "$BAT_POW" "$BAT_WH" "$BAT_FULL" "$BAT_HEALTH" \
-    "$([ -n "${BAT_CYC:-}" ] && printf '%s' "$BAT_CYC" || printf 'null')" "$BAT_LEFT"
+    "$(isnum "${BAT_CYC:-}" && printf '%s' "$BAT_CYC" || printf 'null')" "$BAT_LEFT"
 
 printf '"ac":{"present":%s,"name":"%s","online":%s},' \
     "$(boolv "$AC_PRESENT")" "$(jesc "$AC_NAME")" "$(boolv "${AC_ONLINE:-0}")"
@@ -395,8 +432,8 @@ printf '"cpu":{"model":"%s","temp":%s,"temp_max":%s,"freq_mhz":%s,"profile":"%s"
     "$([ -n "${CPU_FREQ:-}" ] && printf '%s' "$CPU_FREQ" || printf 'null')" \
     "$(jesc "${PLATFORM_PROFILE:-}")"
 
-printf '"gpu":{"available":%s,"state":"%s","name":"%s","power":%s,"temp":%s,"util":%s,"age":%s},' \
-    "$GPU_AVAILABLE" "$(jesc "$GPU_STATE")" "$(jesc "$GPU_NAME")" \
+printf '"gpu":{"available":%s,"state":"%s","error":%s,"name":"%s","power":%s,"temp":%s,"util":%s,"age":%s},' \
+    "$GPU_AVAILABLE" "$(jesc "$GPU_STATE")" "$GPU_ERROR" "$(jesc "$GPU_NAME")" \
     "$GPU_POW" "$GPU_TEMP" "$GPU_UTIL" "$GPU_AGE"
 
 printf '"system":{"power":%s,"source":"%s","components":%s}}\n' \

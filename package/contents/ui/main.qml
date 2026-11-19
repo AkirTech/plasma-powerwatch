@@ -476,6 +476,11 @@ PlasmoidItem {
                     if (!root.gpu.available) {
                         return "—";
                     }
+                    // nvidia-smi 在驱动不可用（如内核升级后模块没重建）时会把
+                    // 报错打到 stdout 并以非零码退出，采集器会标出 error
+                    if (root.gpu.error === true) {
+                        return "驱动不可用";
+                    }
                     if (root.gpu.state === "suspended") {
                         return "已挂起";
                     }
